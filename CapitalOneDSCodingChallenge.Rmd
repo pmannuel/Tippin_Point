@@ -1,0 +1,944 @@
+---
+title: "Capital One Data Science Coding Challenge"
+author: "Priscilla Mannuel"
+date: "February 10, 2018"
+language: R
+output: html_document
+---
+
+This markdown is part of the submission for Capital One Data Science Coding Challenge. In this markdown, I will analyze the [New York City Green Taxi data](http://www.nyc.gov/html/tlc/html/about/trip_record_data.shtml) for the month of September 2015 and build a model to predict tip as a percentage of the total fare. 
+
+Green Taxis (as opposed to yellow ones) are taxis that are not allowed to pick up passengers inside of the densely populated areas of Manhattan. The detailed data documentation can be found [here](http://www.nyc.gov/html/tlc/downloads/pdf/data_dictionary_trip_records_green.pdf). Additionally, a high-level analysis is detailed in the powerpoint attached. 
+
+In the interest of time, I opted for R because statistical models can be written with only a few lines in R and because it performs well for standalone computing on an individual server.
+
+* [Initialization]
+* [Data Overview]
+* [Data Analysis of Trip Distance]
+* [Effect of hour of day on Trip Distance]
+* [Airport Trips]
+* [Data Analysis of Trip Speed]
+* [Predicting Tip Amount]
+* [Future Work]
+* [Case Questions and Answers]
+
+## Initialization
+
+```{r, results='hide', warning=FALSE, message=FALSE}
+library(ggplot2)
+library(reshape2)
+library(GPArotation)
+library(psych)
+library(lubridate)
+library(plyr)
+library(ggpubr)
+library(corrplot)
+library(lattice)
+library(Amelia)
+library(tidyr)
+library(fitdistrplus)
+library(bst)
+library(MASS)
+library(caret)
+library(randomForest)
+```
+
+Due to time constraint and the relatively small data size, I downloaded then loaded the data file in RStudio in one shot.
+
+```{r}
+#loading data
+dataPath <- "~/UChicago - Winter 2018"
+
+now <- Sys.time()
+
+df <- read.csv(file=paste(dataPath,"green_tripdata_2015-09.csv",sep="/"),header=TRUE,sep=",")
+
+#data processing time
+dur <- round(Sys.time() - now, digits = 3)
+
+df.copy <- df #copy for building predictive model
+
+#data dim
+cbind(nrow = nrow(df), ncol = ncol(df))
+
+cat(paste("\nData loading time:",  
+          dur, "secs", sep = " "))
+
+```
+
+## Data Overview
+
+I start the data exploration by getting a brief overview of the data, keeping in mind the end goal of building a model to predict tip.
+
+```{r}
+#overview
+str(df)
+
+#descriptive statistics (excluded datetime vars)
+sapply(df[,-c(2,3)],summary)
+
+#columns with missing vals
+colnames(df)[colSums(is.na(df)) > 0]
+```
+
+**Summary of Data**
+
+The data has **1,494,926 rows** and **21 columns** of datetime, categorical and numerical data. On a glance, I noticed a few errors when referring to the data documentation:
+
+* Ehail fee and Trip type have missing values
+* There are errors in range (e.g. values should not be negative) for monetary variables.
+* Incorrect number of levels. For example, there is no 99 label for Rate Code Id.
+
+These errors will be fixed and investiugated further in the data cleaning step.
+
+## Data Analysis of Trip Distance
+
+By [rule of thumb](https://www.google.com/search?q=rule+of+thumb+taxi+tip&oq=rule+of+thumb+taxi+tip&aqs=chrome..69i57.8761j0j7&sourceid=chrome&ie=UTF-8), taxi tip is usually 15 to 20 percent of the fare. Since fare is determined by distance, trip distance seems to be a significant variable worth exploring. A histogram for the "Trip_Distance" column in the dataset is generated, with 50 bins that range from values 0 to 603.1 on the x-axis.
+
+```{r}
+qplot(as.numeric(df$Trip_distance),
+        geom="histogram",
+        bins = 50,  
+        main = "Histogram for Trip Distance", 
+        xlab = "Trip Distance",  
+        fill=I("blue4"),
+        col="red",
+        show.legend = FALSE)
+```
+```{r}
+summary(df$Trip_distance)
+```
+
+Visually, the trip distance is distributed asymmetrically, skewing to the right with a long tail. Data that have a lower bound (0 in this case) are often skewed right. This agrees with distance being a non-negative value. This also imply that majority of the trips are short-duration and that long distance trips are rare (outliers).
+
+```{r}
+tripdist_quant <- quantile(df$Trip_distance, seq(0,1,0.01))
+tripdist_quant <- data.frame(fval=seq(0,1,0.01), q=tripdist_quant, row.names=NULL)
+
+xyplot(q ~ fval, 
+       tripdist_quant,
+       xlab = "Proportion", 
+       ylab = "Trip Distance (miles)",
+       type = c("p", "g"), 
+       subset = q < 40)
+```
+
+The plot above corroborate the previous assumption. Approximately 90% of the trips are 5 miles or less.
+
+```{r}
+tripdist.15less <- df[df$Trip_distance<15,]$Trip_distance + 0.0001
+
+fw <- fitdist(tripdist.15less, "weibull")
+fln <- fitdist(tripdist.15less, "lnorm")
+
+#plot fit
+plot.legend <- c("Weibull", "Lognormal")
+p1 <- denscomp(list(fw, fln), legendtext = plot.legend)
+
+#compare AIC values of the three fits
+rbind(c("Weibull.AIC", "Lognormal.AIC"),round(c(fw$aic,fln$aic),0))
+```
+
+The distribution of the trip distance is not normal, hence the variable is not random because a natural limit prevents outcome on one side. This indicates the existance of a trend in trip distance. Log-Normal and Weibull distributions are the most popular distributions for modelling skewed data. I test the fit of both distribution to the data (removing the outliers). Based on the AIC values, the Weibull distribution is the better fit.
+
+## Effect of hour of day on Trip Distance
+
+Now let us see if hour of day has an effect on trip distance. Firstly, I extracted the hour from the pickup and dropoff datetime columns.
+
+```{r}
+df$lpep_pickup_datetime <- as.POSIXct(df$lpep_pickup_datetime,format='%Y-%m-%d %H:%M:%S')
+df$Lpep_dropoff_datetime <- as.POSIXct(df$Lpep_dropoff_datetime,format='%Y-%m-%d %H:%M:%S')
+
+#extracting pickup and dropoff hours
+df$pickup_hr <- hour(df$lpep_pickup_datetime)
+df$pickup_hr <- as.factor(df$pickup_hr)
+
+df$dropoff_hr <- hour(df$Lpep_dropoff_datetime)
+df$dropoff_hr <- as.factor(df$dropoff_hr)
+
+#validate transformation
+# levels(pickup_hr)
+# levels(dropoff_hr)
+```
+```{r}
+trip_dist_by_hr <- aggregate(df[,c("Trip_distance")], list(df$pickup_hr), function(x) c(mean = round(mean(x),4), median = round(median(x),4)))
+
+trip_dist_by_hr <- data.frame(
+  hr=seq(0,23),
+  mean=trip_dist_by_hr$x[,1],
+  median=trip_dist_by_hr$x[,2])
+
+ggplot(trip_dist_by_hr, aes(hr)) + 
+  geom_line(aes(y = mean, colour = "mean")) + 
+  geom_line(aes(y = median, colour = "median")) +
+  labs(y = "trip distance (miles)", title = "Mean and Median Trip Distance by Time of Day")
+
+trip_dist_by_hr
+```
+
+ Categorizing [time of the day](http://learnersdictionary.com/qa/parts-of-the-day-early-morning-late-morning-etc) as:
+
+* Early Morning - 5 to 8
+* Late Morning - 11 to 12
+* Early Afternoon - 13 to 15
+* Late Afternoon - 16 to 17
+* Evening - 17 to 20
+* Night - 20 to 4
+
+There is a spike in the trip distance in the early morning. Early morning is associated with rush hour, when most people commute to work. There could be higher motivation (e.g. late for work) to take taxi even for longer distance and potentially paying more. In the afternoon, most people are at work and in  the evening, when people are returning from work, there could be less motivation for taxi (e.g. people are more relaxed, no urgency) causing the dip. The smaller spike at night, peaking at midnight, could be an effect of people returning home. It makes common sense that the later into the night, the more traffic there is as late night can be associated with increased in danger or people inebriated from bars/social events - all motivations to take taxi.
+
+Lastly, let's briefly examine the relationship of trip distance and tip amount visually.
+
+```{r}
+pt.1 <- ggplot(data = df[df$Trip_distance<100,], aes(x = Trip_distance, y = Tip_amount)) + geom_smooth(se=FALSE) + 
+  labs(x = "trip distance (miles)", y = "Tip Amount ($)", title = "Trip Distance (<100 miles) vs. Tip Amount")
+
+pt.2 <- ggplot(data = df[df$Trip_distance<100,], aes(x = Trip_distance, y = Tip_amount)) + geom_point() + 
+  labs(x = "trip distance (miles)", y = "Tip Amount ($)", title = "Trip Distance (<100 miles) vs. Tip Amount")
+
+ggarrange(pt.1,pt.2)
+
+summary(df$Tip_amount)
+```
+
+Excluding anomalies (e.g. negative tips, 0 distance), there seem to be a positive relationship between tip amount and trip distance. Trip distance exceeding 32 (between 25 and 50 miles) does not get tipped. It should be noted that another anomaly in the data is the high amount of tips for trip distance close to zero. This anomaly will be taken into consideration when building the predictive model.
+
+This section concludes the exploration of the trip distance variable. Given more time, I would also like to:
+
+* Plot histogram of number of trips by time of day and check if it corroborates the mean and median plot above.
+* Check if the trend varies similarly by day of the week by creating a week variable.
+* Investigate the effect of pickup region on trip distance.
+
+## Airport Trips
+
+A hallmark function of taxi is providing convenient drop-off or pick-up at the airports. Using RateCodeID (2 - JFK and 3 - Newark), a quick calculation of number of airport trips is calculated.
+
+```{r}
+#Number of trips
+num_of_airport_trips <- data.frame(
+  JFK = nrow(df[df$RateCodeID==2,]),
+  Newark = nrow(df[df$RateCodeID==3,]),
+  Total = nrow(df[df$RateCodeID==2 | df$RateCodeID==3,])
+)
+
+#Ave. Fare
+mean_fare_airport_trips <- data.frame(
+  JFK = mean(df[df$RateCodeID==2,c("Fare_amount")]),
+  Newark = mean(df[df$RateCodeID==3,c("Fare_amount")]),
+  Total = mean(df[df$RateCodeID==2 | df$RateCodeID==3,c("Fare_amount")])
+)
+
+#Ave. Tip Percentage
+mean_tip_airport_trips <- data.frame(
+  JFK = mean(df[df$RateCodeID==2,c("Tip_amount")]),
+  Newark = mean(df[df$RateCodeID==3,c("Tip_amount")]),
+  Total = mean(df[df$RateCodeID==2 | df$RateCodeID==3,c("Tip_amount")])
+)
+
+#Ave. Tip Percentage
+med_tip_airport_trips <- data.frame(
+  JFK = median(df[df$RateCodeID==2,c("Tip_amount")]),
+  Newark = median(df[df$RateCodeID==3,c("Tip_amount")]),
+  Total = median(df[df$RateCodeID==2 | df$RateCodeID==3,c("Tip_amount")])
+)
+
+airport_trips_report <- round(rbind(num_of_airport_trips,mean_fare_airport_trips,mean_tip_airport_trips,med_tip_airport_trips),2)
+rownames(airport_trips_report) <- c("Number of Trips","Ave. Fare ($)","Ave. Tip ($)", "Median Tip ($)")
+airport_trips_report
+```
+
+The airport trips only accounts for 0.37% of the total number or trips in the data, however whether or not the trip is an airport trip may be an important predictor of tip amount. Based on the median, it should be noted that significant number of passenger did not tip. This may be attributed to a relatively expensive fare which negates the need for tipping. To quickly test this hypothesis, I am using a t-test to compare the tip amount between airport and non-airport trips.
+
+```{r, warning=FALSE}
+#variable whether or not it is an airport trip
+df$is_airport_trip <- df$RateCodeID
+df$is_airport_trip <- factor(df$is_airport_trip, levels=c(1,2,3,4,5,6), labels=c("0", "1", "1","0","0","0"))
+df$is_airport_trip <- as.character(df$is_airport_trip) #drop excess levels
+df$is_airport_trip <- factor(df$is_airport_trip)
+
+t.test(Tip_amount~is_airport_trip,data = df)
+```
+
+Since my p-value is less than 0.05, I can reject the null hypothesis (that the means are equal). There is a significant different in tip amount, meaning whether or not a passenger is heading to the airport may influence the amount of tip. Studying the distribituion by time of day, Airport trips accounts for approximately half of every trip by the hour. The number of airport trips peak around 3 PM and takes a dip around 4 AM.
+
+```{r, warning=FALSE, message=FALSE}
+df$pickup_hr <- as.numeric(df$pickup_hr)
+df[is.na(df$is_airport_trip),c("is_airport_trip")] <- 1
+
+ggplot(df, alpha = 0.2,
+      aes(x = pickup_hr, group = is_airport_trip, fill = is_airport_trip))+
+      stat_bin(aes(y=log10(..count..)), position='dodge')+ xlim(0,23) + scale_y_continuous(expand = c(0, 0))
+
+df$pickup_hr <- as.factor(df$pickup_hr)
+```
+
+Due to time constraint, I was unable to confirm that all airport trips are accounted for. Trips labelled Negotiated Fare or Group Ride could have been airport trips. Additionally, La Guardia airport was not accounted for. Given more time, I would like to try to increase accuracy of the calculation by deriving a variable to classify airports:
+
+* Use [zipcode package](https://www.r-bloggers.com/my-first-r-package-zipcode/) to classify pick/dropoff locations coordinates to La Guardia. This is possible as La Guardia has its own zip code
+* Get airport coordinates for JFK and Newark from Google Maps Api using [RCurl and RJSONIO](https://rpubs.com/blentley/geocoding) or [public dataset](https://rpubs.com/rsuzuki_okada/dataproducts_week2)
+* Create [bounding box](http://boundingbox.klokantech.com/) of location coordinates for both airports
+* Verifies which trip has pickup/drop-off coordinates that falls in the bounding boxes using [point.in.polygon](https://www.rdocumentation.org/packages/sp/versions/1.2-7/topics/point.in.polygon)
+
+The zipcode method to classify trips to La Guardia was attempted, but this method is computationally too slow for the given time constraint. It might be faster to create a bounding box for La Guardia and perform classification of trips in one operation (versus two).
+
+## Data Analysis of Trip Speed
+
+Given the objective of predicting tip amount and time constraint, I decided to analyze the trip speed (**Option A** of Challenge). From a passenger standpoint, the speed of the trip may affect the amount of tip. Consider the scenario of a passenger waking up late for work hailing a taxi that was able to get the passenger to work on time. I hypothesize that speed is likely to affect the tip amount and thus, be a good predictor for tip amount.
+
+I start the analysis by building a derived variable representing the average speed over the course of a trip.
+
+```{r}
+df$duration_min <- floor(as.double(df$Lpep_dropoff_datetime - df$lpep_pickup_datetime)/60.0) #in min
+df$speed_mph    <- df$Trip_distance/df$duration * 60 #in mph
+
+#Examine speed variable with NaN omitted
+summary(df[!is.nan(df$speed_mph),]$speed_mph)
+```
+
+Straightaway, it does not make sense to have NaN or Inf distance. The entries can be classified as errors that can be generated due to human input error, taxi meter malfunction, etc. I will treat these entries as "missing data". Since the variable is missing at random, is a small percentage of overall speed entries and the data involves multiple variable, I will use [multiple imputation](https://en.wikipedia.org/wiki/Imputation_%28statistics%29#Multiple_imputation) to replace the errors. To treat Inf values, I derived an artificial speed cap . The New York highway has a speed limit of 65 mph. Given that speeding 41 mph+ over the limit [earns a driver 11 points and automatic lisence suspension](https://newyorkspeedingfines.com/), all entries with speed higher than 106 mph (65 + 41) are treated as errors on the high likelihood that taxi drivers would not risk their likelihood. Alternatively, I could also investigate for the highest speed recorded in NYC.
+
+```{r}
+#set possible limit to 15 mph as slowest possible and 240 as fastest possible
+speed_bound <- t(as.matrix(c(8,15,240)))
+
+speed_errors <- which(df$speed_mph > 106 | df$speed_mph < 15 | is.nan(df$speed_mph))
+df[speed_errors,c("speed_mph")] <- NA_character_
+df$speed_mph <- as.numeric(df$speed_mph)
+
+#subset only continuous value to quickly impute missing vals
+#given more time, I would include nominal vals as well (e.g. payment type, trip_type)
+speed.mis <- df[,-c(1:9)]
+#due to time constraint, subset features that logically has a chance of affecting speed
+speed.mis <- speed.mis[,-c(4,5,8,9,11,12,13,14,15)]
+
+amelia_fit <- amelia(speed.mis, m=1, idvars=range(1,7), parallel = "multicore", p2s=0, bound = speed_bound)
+df$speed_mph <- amelia_fit$imputations$imp1$speed_mph
+#summary of imputed speed variable
+summary(df$speed_mph)
+```
+
+The speed data is cleaned. Now, let us look at how speed varies by time. I opt for a box plot to compare outliers and show the spread of data since there should be more variation in speed (as opposed to distance) in regards to time. The boxplot below shows the variation of trip speed by week. On a glance, the average speed does not seem to vary by week.
+
+```{r}
+#extracting week
+df$week <- week(df$lpep_pickup_datetime)
+df$week <- as.factor(df$week)
+df$week <- factor(df$week, levels=levels(df$week), labels=seq(1,5))
+
+#boxplot
+bp1 <- ggplot(df, aes(x = week, y = speed_mph)) + geom_boxplot() + coord_cartesian(ylim = c(15, 40)) + labs(y = "trip speed (mph)", title = "Boxplot of Trip Speed by Week")
+
+#lineplot of mean
+speed_by_week <- aggregate(df[,c("speed_mph")], list(df$week), function(x) c(mean = round(mean(x),4), median = round(median(x),4)))
+
+speed_by_week <- data.frame(
+  week=seq(1,5),
+  mean=speed_by_week$x[,1],
+  median=speed_by_week$x[,2])
+
+lp1 <- ggplot(speed_by_week, aes(week)) + 
+  geom_line(aes(y = mean)) +
+  labs(y = "speed (mph)", title = "Ave. Speed by Week")
+
+ggarrange(bp1,lp1, nrow=2, ncol=1)
+```
+```{r}
+week.aov <- aov(speed_mph ~ week, data=df)
+summary(week.aov)
+
+pairwise.t.test(df$speed_mph, df$week, p.adj="none")
+```
+
+Using one-way analysis of variance (ANOVA), I determined whether or not there are actually statistically significant differences between the average speed grouped by week. P value is < 0.05, hence we reject the null hypothesis. The anova test indicates statistically significant difference between the mean speed, with week 2 being distinctly different compared to other weeks as shown in the pairwise t-test. The pairwise t-test corrborates the spike seen in the visualization. I check for national holidays and [NYC events](https://www.tripsavvy.com/top-things-to-do-in-september-united-states-3300885) for the month September 2015. One possible explanation is week 2 being associated with Patriot's Days and the spike in speed is caused by increased in activity.
+
+Moving on to examining how speed varies by time of day, a spike in trip speed associated in the early morning can be observed. This can be attributed to the urgency of rush hour (as people aim to reach work on time). Additionally, there is a dip in speed (taxi drives more slowly) in the evening which may potentially be caused by increased traffic or lack of urgency or other possible reasonings to be investigated. Given an Anova test with p value < 0.05, it further confirms the dependence of speed with regard to time of day.
+
+```{r}
+#Anova
+tod.aov <- aov(speed_mph ~ pickup_hr, data=df)
+summary(tod.aov)
+```
+```{r}
+#boxplot
+bp1 <- ggplot(df, aes(x = pickup_hr, y = speed_mph)) + geom_boxplot() + coord_cartesian(ylim = c(15, 40)) + labs(y = "trip speed (mph)", x = "hr", ylim = c(15, 40), title = "Boxplot of Trip Speed by Time of Day")
+
+#lineplot of mean
+speed_by_hr <- aggregate(df[,c("speed_mph")], list(df$pickup_hr), function(x) c(mean = round(mean(x),4), median = round(median(x),4)))
+
+speed_by_hr <- data.frame(
+  hr=seq(0,23),
+  mean=speed_by_hr$x[,1],
+  median=speed_by_hr$x[,2])
+
+lp1 <- ggplot(speed_by_hr, aes(hr)) + 
+  geom_line(aes(y = mean)) +
+  labs(y = "speed (mph)", title = "Ave. Speed by Time of Day")
+
+ggarrange(bp1,lp1, nrow=2, ncol=1)
+```
+
+This concludes the exploration of the trip speed variable. Given more time, I would also like to:
+
+* Check traffic and weather data for September 2015 to provide more insight to variation
+* Generate additional features from speed such as segmenting
+
+## Predicting Tip Amount
+
+On to the main part of the project - building the predictive model. I am employing the [Cross Industry Standard Process for Data Mining (CRISP-DM)](https://en.wikipedia.org/wiki/Cross-industry_standard_process_for_data_mining), the leading methodology for tackling business problems using advanced analytics technique. The process is brokened down into:
+
+* [1. Data Cleaning]
+* [2. Feature Engineering]
+* [3. Data Preparation]
+* [4. Data Exploration]
+* [5. Model Building]
+* [6. Evaluation]
+
+**Summary**
+
+The data was first cleaned by removing columns that is mostly empty (Ehail_fee) and imputing columns with recoverable missing values. All variables are also set to the correct range based on the [Metered Fare Information](http://www.nyc.gov/html/tlc/html/passenger/taxicab_rate.shtml).
+
+Afterwards, 7 new features were engineered: week, hour, duration, speed, tip percentage and logical variables to identify airport trips and trips that received a tip.
+
+Through data exploration, I determine if the data is robust for model development and if not reduce the number of features. I first removed near zero variance predictors and performed a Factor analysis to determine the communality or uniqueness of each variable. I then conducted a collinearity analysis and reduce dataset by removing co-linear variables. Lastly, I built a tree based model to understand variable relationships and to create variable importance chart to determine which variables contribute to price the most.
+
+**The final model** is an ensemble of a random forest classification model and gradient boosting regression model.
+
+At this level of analysis, the final model is a proof of concept. Given more time, I would perform the following to further refine the model:
+
+* I would perform generalization by running a lasso or ridge to reduce dataset if necessary.
+* Utilize AutoML (Python based package) to conduct a high-level survey of viable algorithms. Fit data to several different models for both classification and regression analysis and indentify the best models.
+* Deploy a Microsoft Azure model to test and refine the final model using the full dataset.
+
+## 1. Data Cleaning
+
+During the data overview, some errors have been identified. In this section, I further investigated by performing a data sanity check and subsequent data cleaning as followed:
+
+* Dropped *Ehail_fee* due to 99% of data missing
+* Impute missing values in *Trip_type* with mode
+* All values that should be non-negative (e.g. distance, monetary) are set as their absolute values
+* Each variables are ensured to be in the correct range according to data documentation and [Metered Fare Information](http://www.nyc.gov/html/tlc/html/passenger/taxicab_rate.shtml)
++ The minimum *Fare_amount* should be $2.50 according to [initial charge](http://www.nyc.gov/html/tlc/html/passenger/taxicab_rate.shtml)
++ The correct *Total_amount* is calculated subsequent
+* Every variable/column are casted into the correct class (e.g. factor, datetime or numeric)
+
+```{r}
+
+clean <- function(df){
+  
+  names(df) <- tolower(names(df))
+  
+  ######################
+  # fix missing values
+  ######################
+  
+  #drop Ehail_fee because there is too much missing values
+  df <- subset(df, select = -c(ehail_fee))
+  
+  #replace 4 missing values in trip_type with mode
+  df[is.na(df$trip_type),c("trip_type")] <- as.numeric(names(sort(-table(df$trip_type)))[1])
+  
+  ######################
+  # all variables that should not be negative have their absolute values
+  ######################
+  df[,11:18] <- lapply(df[,11:18], abs)
+  
+  ######################
+  # cast variables in the correct range of levels
+  ######################
+  #RateCodeId should be int between 1 and 6
+  df[df$ratecodeid>6 | df$ratecodeid<1,5] = as.numeric(names(sort(-table(df[df$ratecodeid<7 | df$ratecodeid>0,5]))[1]))
+  
+  #Extra should only be 0.50 or 1 or 0
+  df[df$extra!=1 & df$extra!=0 & df$extra!=0.5 ,c("extra")] = 0
+  
+  #Fare and total amount should be minimum $2.50
+  df[df$fare_amount<2.50, c("fare_amount")] = 2.50
+  
+  total_amount_sum = c("fare_amount","extra","mta_tax","tolls_amount","improvement_surcharge")
+  df[df$total_amount<2.50, c("total_amount")] = rowSums(df[df$total_amount<2.50, total_amount_sum])
+  
+  #Based on highest fare amount of $580.50, the max trip distance (best case) possible is 231.20 miles
+  df[df$trip_distance>231.20,c("trip_distance")] = 231.20
+  
+  ######################
+  #cast variables to correct class
+  ######################
+  df$vendorid <- as.factor(df$vendorid)
+  
+  df$lpep_pickup_datetime <- as.POSIXct(df$lpep_pickup_datetime,format='%Y-%m-%d %H:%M:%S')
+  df$lpep_dropoff_datetime <- as.POSIXct(df$lpep_dropoff_datetime,format='%Y-%m-%d %H:%M:%S')
+  
+  classes <- c("character",
+               "character","numeric","numeric","numeric",
+               "numeric","integer","numeric","numeric",
+               "numeric","numeric","numeric","numeric",
+               "numeric","numeric","character","character")
+  
+  df[4:ncol(df)] <- Map(`class<-`, df[4:ncol(df)], classes)
+  
+  #cast chr to factors
+  df <- as.data.frame(unclass(df))
+  
+  return(df)
+}
+
+df.clean <- clean(df.copy)
+
+```
+
+Data cleaning measures that would be performed given more time:
+
+* Designed a more robust function that accounts for an input with different column order.
+* Check data sanity against all rules accounted in [Metered Fare Information](http://www.nyc.gov/html/tlc/html/passenger/taxicab_rate.shtml)
+* When cleaning extra column, [$0.50 and $1 should be assigned to overnight and rush hour trips respectively](http://www.nyc.gov/html/tlc/html/passenger/taxicab_rate.shtml). I would have replaced the values according to the pickup and dropoff date tie.
+* When cleaning trip distance, I would check against distance derived from coordinates to improve data sanity.
+
+##2. Feature Engineering
+
+In this section, based on previous analysis and understanding of data, I created new features to improve prediction:
+
+* __Time variables__: Week and Hour of each trip in September 2015
+* __Duration in min__: The duration of the trip in minutes
+* __Speeh in mph: The average speed of the trip in mph
+* __Is airport trip__: 1 or 0 to act as boolean indicating whether or not the trip is an airport trip
+* __With tip__: 1 or 0 to act as boolean indicating whether or not the trip received a tip. This acts as the Predict Column for classification.
+* __Tip percent__: Trip as a percentage of total amount
+
+I also dropped some features:
+
+* __Store and fwd flag__: This variable could provide insight during data cleaning but at this stage, knowing whether the meter was connected to the server does not relate to tip percentage.
+* __Coordinates__: Given more time, the longtitude and latitude could be used to derive more features (e.g. pick-up location, destination) and to validate other features (e.g. distance). These were attempted but proved to be computationally slow. This was dropped under the hypothesis that trip speed and duration would be sufficient if not better predictors than location.
+
+```{r, warning=FALSE}
+
+engineer.feature <- function(df){
+  
+  ##### drop columns #####
+  df <- subset(df, select = -c(store_and_fwd_flag, dropoff_latitude, dropoff_longitude))
+  
+  ##### time variables #####
+  df$pickup_hr <- hour(df$lpep_pickup_datetime)
+  df$pickup_hr <- as.factor(df$pickup_hr)
+  
+  df$dropoff_hr <- hour(df$lpep_dropoff_datetime)
+  df$dropoff_hr <- as.factor(df$dropoff_hr)
+  
+  df$week <- week(df$lpep_pickup_datetime)
+  df$week <- as.factor(df$week)
+  df$week <- factor(df$week, levels=levels(df$week), labels=seq(1,5))
+  
+  
+  ##### trip duration in min #####
+  df$duration_min <- floor(as.double(df$lpep_dropoff_datetime - df$lpep_pickup_datetime)/60.0) #in min
+
+  
+  ##### ave speed in mph #####
+  df$speed_mph    <- df$trip_distance/df$duration * 60 #in mph
+  speed_errors <- which(df$speed_mph > 106 | df$speed_mph < 15 | is.nan(df$speed_mph))
+  df[speed_errors,c("speed_mph")] <- NA_character_
+  df$speed_mph <- as.numeric(df$speed_mph)
+  speed.mis <- df[,-c(1:6)]
+  speed.mis <- speed.mis[,-c(10:14)]
+  speed_idx <- which(colnames(speed.mis)=="speed_mph")
+  speed_bound <- t(as.matrix(c(speed_idx,15,240)))
+  amelia_fit <- amelia(speed.mis, m=1, idvars=range(1,10), parallel = "multicore", p2s=0, bound = speed_bound)
+  df$speed_mph <- amelia_fit$imputations$imp1$speed_mph
+  
+  
+  ##### is airport trip #####
+  df$is_airport_trip <- df$ratecodeid
+  df$is_airport_trip <- factor(df$is_airport_trip, levels=c(1,2,3,4,5,6), labels=c("0", "1", "1","0","0","0"))
+  df$is_airport_trip <- as.character(df$is_airport_trip) #drop excess levels
+  df$is_airport_trip <- factor(df$is_airport_trip)
+  
+  
+  ##### with tip ######
+  df$with_tip <- as.factor(as.character(as.numeric(df$tip_amount>0)))
+  
+  
+  ##### tip percent #####
+  df$percent  <- df$tip_amount/df$total_amount * 100
+  
+  ##### drop columns #####
+  df <- subset(df, select = -c(lpep_dropoff_datetime, lpep_pickup_datetime, pickup_longitude, pickup_latitude))
+  
+  return(df)
+}
+
+df <- engineer.feature(df.clean)
+
+```
+
+##3. Data Preparation
+
+Split the data into train and test set. The training data is limited to 5,000 rows due to memory restrictions on my system. Ideally, I would perform a train and holdout dataset with a 7:3 ratio.
+
+```{r}
+sample.sz <- 5000
+
+# Set seed to ensure reproducibility between runs
+set.seed(711)
+
+train.indx <- sample(x = nrow(df), size = sample.sz, replace = FALSE)
+train <- df[train.indx, ]
+test <- df[-train.indx, ]
+
+test.indx <- sample(x = nrow(test), size = sample.sz, replace = FALSE)
+test <- df[test.indx, ]
+
+```
+
+##4. Data Exploration
+
+**Summary**
+
+In this section, the following exploratory analysis were performed:
+
+* Studied correlation between variables and identify strong predictors
+* Removed features with low variances using nearZerovar() from caret package
+* Performed a Factor analysis to determine the communality or uniqueness of each variable and reduce dataset by removing co-linear variables
+* Determined feature importance
+
+The study found these features as the best predictors:
+
+* Classification predictors: payment_type, total_amount, trip_distance, duration_min, speed_mph, pickup_hr, extra, is_airport_trip
+* Regression predictors: trip_distance, duration_min, speed_mph, fare_amount
+
+**Exploration**
+
+```{r, echo=FALSE}
+qplot(df$percent,
+        geom="histogram",
+        bins = 50,  
+        main = "Distribution of Percentage of Tip", 
+        xlab = "Percentage of tip (%)",  
+        fill=I("blue4"),
+        col="red",
+        show.legend = FALSE)
+```
+
+59.67% of all trips did not receive a tip. But, it should be noted that there is an increase in count around the 13% - 18%, which agrees with the tipping culture in United States. 
+
+**Since over half of trips do not receive a tip, most of the predicted percentage of tips should receive a value of 0. The percentage of tip can be more accurately predicted with regression, if first the classification of tip or no tip is determined, followed by regression to predict percentage of trips predicted to receive a tip.**
+
+The plot below explore the correlation of tip amount with respect to numeric variables. Payment_type is the biggest driver, followed by fare_amount and trip_distance.
+
+```{r}
+select <- c("Extra", "Passenger_count", "MTA_tax", "Trip_distance", "Total_amount", "Fare_amount", "Tolls_amount", "Trip_type", "Payment_type", "Tip_amount")
+correlation <- df[,tolower(select)]
+correlation <- sapply(correlation, as.numeric )
+
+corrplot(cor(correlation,use="complete.obs", method = "spearman"),
+         type="lower", method="circle", diag=FALSE)
+
+corrplot(cor(correlation,use="complete.obs", method = "spearman"),
+         type="lower", method="number", diag=FALSE)
+```
+
+It's no surprise that payment type is an important variable. Most of the passengers that tip favors paying with the **credit card (1)**. This variable would be a strong classifier, especially in a random forest algorithm due to the imbalance in frequency.
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(df[df$with_tip==1,], alpha = 0.2,
+      aes(x = percent, group = payment_type, fill = payment_type))+
+      stat_bin(aes(y=log10(..count..)), position='dodge')+ xlim(0,100) + scale_y_continuous(expand = c(0, 0))
+
+print("Frequency table of payment type")
+print(table(df[df$with_tip==1,]$payment_type))
+```
+
+Near zero variance predictors are variables that have extemely low variances. This means that there is very little information in these variables because they mostly consist of a single value (e.g. zero).
+
+```{r, eval=FALSE}
+remove_cols <- nearZeroVar(df, names = TRUE)
+```
+
+I then performed a Factor analysis to determine the communality or uniqueness of each variable. Among the many ways to do latent variable factor analysis, one of the better is to use Ordinary Least Squares to find the minimum residual (minres) solution. This produces solutions very similar to maximum likelihood even for badly behaved matrices.
+
+```{r, eval=FALSE}
+fa(correlation,nfactors=3,rotate="oblimin",fm="minres")
+```
+
+Using the caret package, I then conducted a collinearity analysis and reduce dataset by removing co-linear variables. As expected, the oput returned column indexes [5, 6, 3] which corresponds to ["total_amount","fare_amount","mta_tax"] since the total amount is derived from a linear combination of the other two variables. Mta_tax will be dropped.
+
+```{r, eval=FALSE}
+caret::findCorrelation(cor(correlation,use="complete.obs", method = "spearman"))
+```
+
+Lastly, I built a tree based model to understand variable relationships and to create variable importance chart to determine which variables contribute to predicting tip (or no tip) the most.
+
+```{r}
+# Set seed to ensure reproducibility between runs
+set.seed(711)
+
+## Fit decision model to training set
+tip.rf.model <- randomForest(with_tip ~ ., data=train[,-c(8,21)], importance=TRUE, ntree=150)
+
+## show variable importance
+varImpPlot(tip.rf.model)
+importance(tip.rf.model)
+```
+
+Studying tipping percentage variation throughout the days and hours, it is shown that tipping varies with time. The passenger tipping behavior varies throughout the day. The passengers do not routinely give out the same average percentage of tips from morning to midnight. Instead, passengers tip more generously during the morning rush hours, evening and late into the night as indicated as the areas in white.
+
+```{r, echo=FALSE, warning=FALSE}
+df.clean$speed_mph <- df$speed_mph
+df.clean$day <- wday(df.clean$lpep_pickup_datetime)
+df.clean$day <- as.factor(df.clean$day)
+df.clean$hour <- hour(df.clean$lpep_pickup_datetime)
+df.clean$hour <- as.factor(df.clean$hour)
+df.clean$percent  <- df.clean$tip_amount/df.clean$total_amount * 100
+
+df.clean <- subset(df.clean, 
+                  payment_type == 1 |
+                  payment_type == 2 |
+                  percent <= 100)
+
+df.heat <- aggregate(percent~day+hour, df.clean, mean)
+
+ggplot(data = df.heat, aes(x=day, y=hour, fill=percent)) + geom_tile() + scale_fill_gradientn(colors=c('dark red','red','orange','yellow','white')) + scale_x_discrete(name='week day', labels=c('1'='S','2'='M','3'='T','4'='W','5'='T','6'='F','7'='S')) + ggtitle('Percentage of Tip (from total fare) in a weekday vs hour') + ylab('hour')
+```
+
+It also seems that tip percentage varies with speed. The points can be approximated with a linear curve. This is a strong indication that the relationship between speed vs consensus tipping percentages is non linear. 
+
+```{r, echo=FALSE, warning=FALSE}
+ggplot(df.clean, aes(x=speed_mph, y=percent))  + scale_x_continuous(
+name='speed (mph)')+ geom_smooth(se = FALSE) + ylab('tip percentages') + ggtitle('The Percentage of Tip with respect to Speed')
+```
+
+**I performed residual diagnostic in regression for all continuous variables. If the residuals spread randomly around the band indicating homogeneity of error variance, it signifies a linear relationship. All continuous variables revealed non-linear relationships. Since there is no linear relationship between the the Tip percentage and variables, linear modelling cannot be used to predict percentage of tips.**
+
+##5. Model Building
+
+The predictive model will be an ensemble model comprising of a classification model to predict (1) tip (0) no tip and a regression model to predict tip percentage of trips that received tips. The esemble model led to a better prediction and a more stable model compared to a single model fit.
+
+**Classification Model**
+
+* Algorithm: Random Forest
+* Optimum variables: payment_type, total_amount, trip_distance, duration_min, speed_mph, pickup_hr, extra, is_airport_trip
+* Optimum number of trees: 130
+* Optimized metric: Accuracy
+* Accuracy: 0.9558
+
+```{r}
+fit.randomf <- function(train){
+  # Set seed to ensure reproducibility between runs
+  set.seed(711)
+  
+  # Subset the features we want to use
+  features <- c("with_tip", "payment_type", "total_amount", "trip_distance", "duration_min",
+                "speed_mph", "pickup_hr", "extra", "is_airport_trip")
+
+  # Set up caret to perform 5-fold cross validation repeated 3 times
+  caret.control <- trainControl(method = "repeatedcv",
+                                number = 5,
+                                repeats = 3)
+  
+  # Use caret to train a Random Forest using 5-fold cross 
+  # validation repeated 3 times and use 5 values for tuning the
+  # mtry parameter. Use 120 trees as our data is small.
+  rf.cv <- train(with_tip ~ ., 
+                 data = train[, features],
+                 method = "rf",
+                 trControl = caret.control,
+                 tuneLength = 5,
+                 ntree = 120, 
+                 importance = TRUE)
+  
+  # Display the results of the cross validation run
+  print(rf.cv)
+  
+  # Pull out the the trained model using the best parameters on all data
+  rf.best <- rf.cv$finalModel
+  varImpPlot(rf.best)
+  
+  return(rf.cv)
+}
+
+```
+
+**Regression Model**
+
+* Algorithm: Gradient Boosting
+* Optimum variables: trip_distance, duration_min, speed_mph, fare_amount
+* Optimum number of trees: 2
+* Optimized metric: RMSE, R^2, MAE
+* Accuracy: 8.67, 0.013, 7.87 respectively
+
+```{r}
+
+fit.regress <- function(train){
+  # Set seed to ensure reproducibility between runs
+  set.seed(711)
+  
+  # Subset the features we want to use
+  features <- c("percent", "trip_distance", "duration_min", "speed_mph", "total_amount")
+  
+  # Set up caret to perform 5-fold cross validation repeated 3 times
+  caret.control <- trainControl(method = "cv",
+                                number = 3)
+  
+  grid <- expand.grid(n.trees = seq(1,3,1), interaction.depth = 2, shrinkage = .1, n.minobsinnode = 20)
+  
+  # Use bst to train a Gradient Boosting using 5-fold cross 
+  # validation repeated 3 times. and use 5 values for tuning the
+  # mtry parameter.
+  tip.bst.model <- train(percent ~ ., 
+                         data = train[, features], 
+                         method = 'gbm', 
+                         trControl = caret.control,
+                         tuneGrid=grid)
+  plot(tip.bst.model)
+  
+  print(tip.bst.model)
+  
+  return(tip.bst.model)
+}
+
+```
+
+**Ensemble Model**
+
+```{r}
+predict_tip_percentage <- function(train,test){
+  
+  #remove variables that obscure prediction based on data exploration
+  train <- subset(train, select=-c(vendorid,ratecodeid,passenger_count,dropoff_hr))
+  test <- subset(test, select=-c(vendorid,ratecodeid,passenger_count,dropoff_hr))
+  
+  print("Classification Model Performance Overview")
+
+  #fit random forest classifier
+  tip.cf.model <- fit.randomf(train)
+  
+  #generate a new column and assign tip or no tip prediction as boolean 
+  test$pred_with_tip <- predict(tip.cf.model, test,  type = "raw")
+  
+  print("Regression Model Performance Overview")
+  
+  #fit gradient boosting regression
+  tip.rg.model <- fit.regress(train)
+  
+  #Intialize all tip percentage to zero
+  test$pred_tip_percent <- 0
+  
+  #for trips classified to be with tip, predict the tip percentage
+  test[test$pred_with_tip==1,]$pred_tip_percent <- predict(tip.rg.model, test[test$pred_with_tip==1,])
+  
+  return(test)
+}
+```
+
+##6. Evaluation
+
+```{r}
+# Function that test the final ensemble model
+res <- predict_tip_percentage(train,test)
+```
+
+**Conclusion**
+
+Overall, the ensemble models for predicting tip percentage of taxi trips performed decently but there is much room for improvement. The first half of the model, the binary classifier, was able to predict tip (or no tip) well with an accuracy of 0.956.  The regression half achieved a value of 7.36 for RMSE and 0.33 for R^2 which are relatively poor. The results and error analysis for the most part supported my intuitions on the usefulness of the features, however the QQplot of residuals shows a heavy tailed distribution on the right end indicating a "heteroscedasticity" in the errors. Meaning, the variance of the residuals may not be constant. To overcome this problem, a transformation of the forecast variable (such as a logarithm or square root) may be required. However, I strongly expect significant improvement in the regression model score, once the model is trained with a larger (or full) dataset. 
+
+**In the future, I will consider other algorithms for each half of the essemble model (including neural network) and determing the best model.**
+
+```{r, include=FALSE}
+actual <- res$percent
+pred <- res$pred_tip_percent
+
+#Classifier accuracy
+postResample(pred = res$pred_with_tip, obs = res$with_tip)
+
+# Calculates Root Mean Squared Error
+rsme<- caret::RMSE(pred,actual)
+ 
+# Calculates Mean Absolute Error
+mae <- caret::MAE(pred,actual)
+
+# Calculates R2
+R2 <- 1 - (sum((actual-pred )^2)/sum((actual-mean(actual))^2))
+
+# Plot error (residuals)
+error <- res$percent - res$pred_tip_percent
+qqnorm(error)
+```
+```{r, echo=FALSE}
+#Print out a summary of statistics
+cat(paste("Root Mean Squared Error:",  
+          round(rsme,2), "\n", sep = " "))
+cat(paste("Mean Absolute Error:",  
+          round(rsme,2), "\n", sep = " "))
+cat(paste("R squared:",  
+          round(R2,2), "\n", sep = " "))
+
+```
+
+## final_predict_tip_percent(data, newdata,seed.in)
+
+**Below is the final representation of the model, where:** 
+
+* data = training data
+* newdata = data with variable to predict
+* seed.in = seed value
+
+The script ver. for this model is attached. Given more time I would have added more features and feedback for debugging in the script.
+
+```{r}
+
+final_predict_tip_percent <- function(data,newdata,seed.in){
+  
+  df.clean <- clean(data)
+  df <- engineer.feature(df.clean)
+
+  # Set seed to ensure reproducibility between runs
+  set.seed(seed.in)
+  
+  tip.cf.model <- fit.randomf(train)
+  
+  newdata$pred_with_tip <- predict(tip.cf.model, newdata,  type = "raw")
+  
+  tip.rg.model <- fit.regress(train)
+  
+  newdata$pred_tip_percent <- 0
+  newdata[newdata$pred_with_tip==1,]$pred_tip_percent <- predict(tip.rg.model, newdata[newdata$pred_with_tip==1,])
+
+  # Write out a .CSV suitable for Kaggle submission
+  write.csv(res, file = "MySubmission.csv", row.names = FALSE)
+  
+  return(newdata)
+}
+
+```
+
+## Future Work
+
+Once the predictive model is built, these are three future steps to consider.
+
+**1) Improve model performance** - Once the model is built, the next step would be to to share findings with the company, and incorporate the gathered feedbacks into further model refinement. 
+
+**2) Convert insights into actions** - While performing exploratory analysis, insights were gathered. In a real world scenario, a taxi company can benefit from these insights to improve business operations, employee performance and customer satisfaction. While building the classification model, we identified drivers in the act of tipping. Whether or not a passenger tips can be translated as customer satisfaction. The taxi company should consider the identified predictors (e.g. speed, duration) when developing the quality aspect of their taxi rides. Meanwhile, taxi drivers can utilize the cyclical nature of taxi ride identified to increase the amount of trips and thereby improve profit. As for the predictive model, the company can utilize it to gain an estimated values of future tips. Having this information will help in forecasting revenue, leading to more informed desicion making.
+
+**3) Generate data visualizations with D3** - Employees and high senior level can interact and better understand information when presented in a beautiful and easy-to-digest format. D3 is a great medium for such delivery. For example, a chord diagram is a consicise and visually powerful method to convey the magnitude of cross-borough traffic.
+
+## Case Questions and Answers
+
+Question 1: [Initialization]
+
+* Programmatically download and load into your favorite analytical tool the trip data for September 2015
+* Report how many rows and columns of data you have loaded.
+
+Question 2: [Data Analysis of Trip Distance]
+
+* Plot a histogram of the number of the trip distance ("Trip Distance").
+* Report any structure you find and any hypotheses you have about that structure.
+
+Question 3: [Effect of hour of day on Trip Distance] , [Airport Trips]
+
+* Report mean and median trip distance grouped by hour of day.
+* We'd like to get a rough sense of identifying trips that originate or terminate at one of the NYC area airports. Can you provide a count of how many transactions fit this criteria, the average fare, and any other interesting characteristics of these trips.
+
+Question 4: [Predicting Tip Amount]
+
+* Build a derived variable for tip as a percentage of the total fare.
+* Build a predictive model for tip as a percentage of the total fare. Use as much of the data as you like (or all of it). We will validate a sample.
+
+Option A: [Data Analysis of Trip Speed]
