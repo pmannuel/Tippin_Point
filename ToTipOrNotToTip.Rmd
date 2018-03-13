@@ -1,12 +1,10 @@
 ---
-title: "Capital One Data Science Coding Challenge"
+title: "To Tip or Not To Tip"
 author: "Priscilla Mannuel"
 date: "February 10, 2018"
 language: R
 output: html_document
 ---
-
-This markdown is part of the submission for Capital One Data Science Coding Challenge. In this markdown, I will analyze the [New York City Green Taxi data](http://www.nyc.gov/html/tlc/html/about/trip_record_data.shtml) for the month of September 2015 and build a model to predict tip as a percentage of the total fare. 
 
 Green Taxis (as opposed to yellow ones) are taxis that are not allowed to pick up passengers inside of the densely populated areas of Manhattan. The detailed data documentation can be found [here](http://www.nyc.gov/html/tlc/downloads/pdf/data_dictionary_trip_records_green.pdf). Additionally, a high-level analysis is detailed in the powerpoint attached. 
 
